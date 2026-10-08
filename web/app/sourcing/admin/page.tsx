@@ -536,7 +536,7 @@ export default function SourcingAdminPage() {
     try {
       const result = await startGoogleLogin({
         embedded,
-        openTab: () => window.open("about:blank", "_blank", "popup=yes,width=520,height=680"),
+        openTab: () => window.open("about:blank", "_blank"),
         redirect: (url) => window.location.assign(url),
         popupOrigin: new URL(apiBaseUrl).origin,
         pairTab: (tab, launchUrl, handoffKey) => pairGoogleLoginTab(window, tab, launchUrl, handoffKey),
