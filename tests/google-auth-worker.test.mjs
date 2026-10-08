@@ -98,6 +98,23 @@ async function embeddedStart(env) {
   return (await worker.fetch(new Request(url), env, { waitUntil() {} })).json();
 }
 
+async function bindEmbeddedBrowser(env, started) {
+  const launched = await worker.fetch(new Request(started.launchUrl), env, { waitUntil() {} });
+  assert.equal(launched.status, 200);
+  const setCookie = launched.headers.get('set-cookie');
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Lax/);
+  const cookie = setCookie.split(';')[0];
+  const state = new URL(started.authorizationUrl).searchParams.get('state');
+  const bound = await worker.fetch(new Request('https://api.example/v1/auth/google/bind', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: 'https://api.example' },
+    body: JSON.stringify({ state, handoffKey: started.handoffKey }),
+  }), env, { waitUntil() {} });
+  assert.equal((await bound.json()).ok, true);
+  return cookie;
+}
+
 test('embedded login issues a private proof separate from the Google URL and keeps a pending iframe unsigned in', async t => {
   const { env, sqlite } = workerFixture(t);
   const started = await embeddedStart(env);
@@ -115,6 +132,7 @@ test('Google success returns one session to the initiating iframe and never open
   const { env, sqlite } = workerFixture(t);
   const started = await embeddedStart(env);
   assert.equal(typeof started.handoffKey, 'string');
+  const cookie = await bindEmbeddedBrowser(env, started);
   const state = new URL(started.authorizationUrl).searchParams.get('state');
   t.mock.method(globalThis, 'fetch', async (url) => {
     if (String(url) === 'https://oauth2.googleapis.com/token') {
@@ -123,7 +141,7 @@ test('Google success returns one session to the initiating iframe and never open
     assert.equal(String(url), 'https://openidconnect.googleapis.com/v1/userinfo');
     return Response.json({ sub: 'test-google-subject', email: 'iframe@example.com', email_verified: true, name: 'Iframe User' });
   });
-  const callback = await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&code=valid-test-code`), env, { waitUntil() {} });
+  const callback = await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&code=valid-test-code`, { headers: { Cookie: cookie } }), env, { waitUntil() {} });
   assert.equal(callback.status, 200);
   assert.equal(callback.headers.get('location'), null);
   assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
@@ -149,13 +167,51 @@ test('cancelled or expired Google login cannot leave the iframe waiting or creat
   const { env, sqlite } = workerFixture(t);
   const started = await embeddedStart(env);
   assert.equal(typeof started.handoffKey, 'string');
+  const cookie = await bindEmbeddedBrowser(env, started);
   const state = new URL(started.authorizationUrl).searchParams.get('state');
-  await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&error=access_denied`), env, { waitUntil() {} });
+  await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&error=access_denied`, { headers: { Cookie: cookie } }), env, { waitUntil() {} });
   const denied = await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} });
   assert.equal((await denied.json()).code, 'GOOGLE_ACCESS_DENIED');
   const expired = await embeddedStart(env);
   sqlite.prepare("UPDATE auth_oauth_states SET expires_at='2000-01-01T00:00:00.000Z' WHERE state=?").run(new URL(expired.authorizationUrl).searchParams.get('state'));
   const timeout = await worker.fetch(completionRequest(expired.handoffKey), env, { waitUntil() {} });
   assert.equal((await timeout.json()).ok, false);
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
+});
+
+test('embedded callback requires the same browser that paired its trusted popup', async t => {
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('An unpaired callback must not contact Google'); });
+  const { env, sqlite } = workerFixture(t);
+  const started = await embeddedStart(env);
+  const state = new URL(started.authorizationUrl).searchParams.get('state');
+  const callbackUrl = `https://api.example/v1/auth/google/callback?state=${state}&code=valid-test-code`;
+  const unbound = await worker.fetch(new Request(callbackUrl), env, { waitUntil() {} });
+  assert.equal(unbound.status, 400);
+  const cookie = await bindEmbeddedBrowser(env, started);
+  const anotherBrowser = await worker.fetch(new Request(callbackUrl), env, { waitUntil() {} });
+  assert.equal(anotherBrowser.status, 400);
+  const wrongCookie = await worker.fetch(new Request(callbackUrl, { headers: { Cookie: cookie.replace(/=.*/, '=wrong-browser') } }), env, { waitUntil() {} });
+  assert.equal(wrongCookie.status, 400);
+  assert.equal(sqlite.prepare('SELECT used_at FROM auth_oauth_states WHERE state=?').get(state).used_at, null);
+  assert.deepEqual(await (await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} })).json(), { ok: true, pending: true });
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
+});
+
+test('a browser binding cannot be overwritten by another launcher and legacy unbound results cannot issue sessions', async t => {
+  const { env, sqlite } = workerFixture(t);
+  const started = await embeddedStart(env);
+  await bindEmbeddedBrowser(env, started);
+  const state = new URL(started.authorizationUrl).searchParams.get('state');
+  const launchedAgain = await worker.fetch(new Request(started.launchUrl), env, { waitUntil() {} });
+  const replacementCookie = launchedAgain.headers.get('set-cookie').split(';')[0];
+  const rebound = await worker.fetch(new Request('https://api.example/v1/auth/google/bind', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: replacementCookie, Origin: 'https://api.example' },
+    body: JSON.stringify({ state, handoffKey: started.handoffKey }),
+  }), env, { waitUntil() {} });
+  assert.equal((await rebound.json()).ok, false);
+  const legacy = await embeddedStart(env);
+  sqlite.prepare("UPDATE auth_oauth_states SET handoff_error='GOOGLE_ACCESS_DENIED' WHERE state=?").run(new URL(legacy.authorizationUrl).searchParams.get('state'));
+  const rejected = await worker.fetch(completionRequest(legacy.handoffKey), env, { waitUntil() {} });
+  assert.equal((await rejected.json()).ok, false);
   assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
 });

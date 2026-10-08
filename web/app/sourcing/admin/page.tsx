@@ -48,7 +48,7 @@ import {
   type TrendRunDetail
 } from "@runacademy/shared";
 import { STATIC_TREND_ROOT_CATEGORIES, getStaticTrendCategoryChildren } from "../../../lib/trend-category-fallback";
-import { startGoogleLogin } from "../../../lib/google-auth-navigation";
+import { pairGoogleLoginTab, startGoogleLogin } from "../../../lib/google-auth-navigation";
 import styles from "./admin.module.css";
 
 const ENV_API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "");
@@ -140,7 +140,7 @@ type AuthFormState = {
 
 type AuthSessionResponse = ApiError | { ok: true; session: AuthSessionState };
 type AuthTokenSessionResponse = ApiError | { ok: true; session: AuthTokenSession };
-type AuthGoogleStartResponse = ApiError | { ok: true; authorizationUrl: string; handoffKey?: string };
+type AuthGoogleStartResponse = ApiError | { ok: true; authorizationUrl: string; handoffKey?: string; launchUrl?: string };
 type AuthGoogleCompletionResponse = ApiError | { ok: true; pending: true } | { ok: true; session: AuthTokenSession };
 
 const initialForm: TrendFormState = {
@@ -538,6 +538,8 @@ export default function SourcingAdminPage() {
         embedded,
         openTab: () => window.open("about:blank", "_blank", "popup=yes,width=520,height=680"),
         redirect: (url) => window.location.assign(url),
+        popupOrigin: new URL(apiBaseUrl).origin,
+        pairTab: (tab, launchUrl, handoffKey) => pairGoogleLoginTab(window, tab, launchUrl, handoffKey),
       }, () => api<AuthGoogleStartResponse>(
         apiBaseUrl,
         `/auth/google/start?return_to=${encodeURIComponent(returnTo)}${embedded ? "&embedded=1" : ""}`,

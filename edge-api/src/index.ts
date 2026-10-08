@@ -150,6 +150,14 @@ export default {
         return respondJson(await completeEmbeddedGoogleAuth(env.DB, body.handoffKey));
       }
 
+      if (request.method === "GET" && pathname === "/v1/auth/google/launch") {
+        return launchEmbeddedGoogleAuth(env.DB, request, env);
+      }
+
+      if (request.method === "POST" && pathname === "/v1/auth/google/bind") {
+        return respondJson(await bindEmbeddedGoogleBrowser(env.DB, request));
+      }
+
       if (request.method === "POST" && pathname === "/v1/auth/logout") {
         return respondJson(await logoutUser(env.DB, request));
       }
@@ -425,7 +433,7 @@ async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
   const now = nowIso();
   const state = randomToken(24);
   const expiresAt = addMinutes(now, AUTH_OAUTH_STATE_TTL_MINUTES);
-  // This proof stays in the initiating frame, never in Google's URL or the popup.
+  // The proof is only shared with the trusted same-browser launcher, never Google.
   const handoffKey = requestUrl.searchParams.get("embedded") === "1" ? randomToken(32) : null;
   const handoffHash = handoffKey ? await sha256Base64Url(handoffKey) : null;
 
@@ -438,9 +446,21 @@ async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
     [crypto.randomUUID(), state, returnTo, now, expiresAt, handoffHash]
   );
 
+  const authorizationUrl = googleAuthorizationUrl(request, googleAuthConfig, state);
+  const launchUrl = new URL("/v1/auth/google/launch", requestUrl.origin);
+  launchUrl.searchParams.set("state", state);
+
+  return {
+    ok: true as const,
+    authorizationUrl: authorizationUrl.toString(),
+    ...(handoffKey ? { handoffKey, launchUrl: launchUrl.toString() } : {})
+  };
+}
+
+function googleAuthorizationUrl(request: Request, config: GoogleAuthConfig, state: string) {
   const authorizationUrl = new URL(GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT);
   authorizationUrl.search = new URLSearchParams({
-    client_id: googleAuthConfig.clientId,
+    client_id: config.clientId,
     redirect_uri: buildGoogleOauthRedirectUri(request),
     response_type: "code",
     scope: "openid email profile",
@@ -448,12 +468,67 @@ async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
     state,
     include_granted_scopes: "true"
   }).toString();
+  return authorizationUrl;
+}
 
-  return {
-    ok: true as const,
-    authorizationUrl: authorizationUrl.toString(),
-    ...(handoffKey ? { handoffKey } : {})
-  };
+function googleBrowserCookieName(state: AuthOauthStateRow) {
+  return `__Host-baegot-google-${state.id}`;
+}
+
+function googleBrowserCookie(request: Request, state: AuthOauthStateRow) {
+  const prefix = `${googleBrowserCookieName(state)}=`;
+  return request.headers.get("cookie")?.split(";").map(value => value.trim()).find(value => value.startsWith(prefix))?.slice(prefix.length) ?? "";
+}
+
+async function launchEmbeddedGoogleAuth(db: D1Database, request: Request, env: Env) {
+  const requestedState = new URL(request.url).searchParams.get("state");
+  const config = getGoogleAuthConfig(env);
+  const state = await one<AuthOauthStateRow>(db, "SELECT * FROM auth_oauth_states WHERE state=? AND provider='google' AND expires_at>? AND used_at IS NULL AND handoff_secret_hash IS NOT NULL LIMIT 1", [requestedState, nowIso()]);
+  if (!config || !state) return respondHtml("로그인 연결이 만료되었습니다. 인트라넷에서 다시 시작해 주세요.", 400, true);
+  const browserNonce = randomToken(32);
+  const scriptNonce = randomToken(24);
+  const frontendOrigin = new URL(state.return_to).origin;
+  // A first-party HttpOnly cookie binds Google's callback to this browser.
+  // Pairing requires the initiating frame's proof through a source/origin-checked message.
+  const script = `const parentWindow=window.opener;
+const state=${JSON.stringify(state.state)};
+const frontendOrigin=${JSON.stringify(frontendOrigin)};
+const destination=${JSON.stringify(googleAuthorizationUrl(request, config, state.state).href)};
+let pairing=false;
+if(!parentWindow){document.getElementById('message').textContent='인트라넷 화면에서 Google 로그인을 다시 시작해 주세요.';window.close();}
+else{
+window.addEventListener('message',async event=>{
+if(pairing||event.source!==parentWindow||event.origin!==frontendOrigin||event.data?.type!=='baegot:google-handoff-bind'||event.data?.state!==state)return;
+pairing=true;
+try{
+const response=await fetch('/v1/auth/google/bind',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({state,handoffKey:event.data.handoffKey})});
+const result=await response.json();
+if(!result.ok)throw new Error('연결을 확인하지 못했습니다. 인트라넷에서 다시 로그인해 주세요.');
+window.opener=null;window.location.replace(destination);
+}catch(error){document.getElementById('message').textContent=error instanceof Error?error.message:'로그인 연결을 확인하지 못했습니다.';}
+});
+parentWindow.postMessage({type:'baegot:google-handoff-ready',state},frontendOrigin);
+}`;
+  return new Response(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>네이버 트렌드 마법사 · Google 로그인</title></head><body><main><h1>Google 로그인 연결 중</h1><p id="message">잠시 후 Google 인증 화면이 열립니다.</p></main><script nonce="${scriptNonce}">${script}</script></body></html>`, { headers: {
+    "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer",
+    "content-security-policy": `default-src 'none'; script-src 'nonce-${scriptNonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+    "set-cookie": `${googleBrowserCookieName(state)}=${browserNonce}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=900`,
+  } });
+}
+
+async function bindEmbeddedGoogleBrowser(db: D1Database, request: Request) {
+  const invalid = { ok: false as const, code: "INVALID_GOOGLE_BROWSER", message: "로그인을 시작한 브라우저를 확인하지 못했습니다. 다시 로그인해 주세요." };
+  if (request.headers.get("origin") !== new URL(request.url).origin) return invalid;
+  const body = await request.json() as { state?: unknown; handoffKey?: unknown };
+  if (typeof body.state !== "string" || typeof body.handoffKey !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(body.handoffKey)) return invalid;
+  const state = await one<AuthOauthStateRow>(db, "SELECT * FROM auth_oauth_states WHERE state=? AND handoff_secret_hash=? AND provider='google' AND expires_at>? AND used_at IS NULL LIMIT 1", [body.state, await sha256Base64Url(body.handoffKey), nowIso()]);
+  if (!state) return invalid;
+  const cookie = googleBrowserCookie(request, state);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(cookie)) return invalid;
+  const browserHash = await sha256Base64Url(cookie);
+  if (state.handoff_browser_hash) return state.handoff_browser_hash === browserHash ? { ok: true as const } : invalid;
+  const paired = await one<{ id: string }>(db, "UPDATE auth_oauth_states SET handoff_browser_hash=? WHERE id=? AND handoff_browser_hash IS NULL AND used_at IS NULL AND expires_at>? RETURNING id", [browserHash, state.id, nowIso()]);
+  return paired ? { ok: true as const } : invalid;
 }
 
 async function completeEmbeddedGoogleAuth(db: D1Database, proof: unknown) {
@@ -464,6 +539,7 @@ async function completeEmbeddedGoogleAuth(db: D1Database, proof: unknown) {
   const state = await one<AuthOauthStateRow>(db, "SELECT * FROM auth_oauth_states WHERE handoff_secret_hash=? AND provider='google' AND expires_at>? AND handoff_consumed_at IS NULL LIMIT 1", [hash, now]);
   if (!state) return invalid;
   if (!state.handoff_user_id && !state.handoff_error) return { ok: true as const, pending: true as const };
+  if (!state.handoff_browser_hash) return invalid;
   // An atomic claim prevents concurrent polling requests from creating two sessions.
   const claimed = await one<AuthOauthStateRow>(db, "UPDATE auth_oauth_states SET handoff_consumed_at=? WHERE id=? AND handoff_consumed_at IS NULL AND expires_at>? RETURNING *", [now, state.id, now]);
   if (!claimed) return invalid;
@@ -478,7 +554,9 @@ async function completeEmbeddedGoogleAuth(db: D1Database, proof: unknown) {
 async function finishGoogleAuth(db: D1Database, state: AuthOauthStateRow, payload: { user?: AuthUser; error?: string }) {
   if (state.handoff_secret_hash) {
     await run(db, "UPDATE auth_oauth_states SET handoff_user_id=?,handoff_error=? WHERE id=?", [payload.user?.id ?? null, payload.error ?? null, state.id]);
-    return respondHtml(payload.error ? "로그인을 완료하지 못했습니다. 인트라넷 화면에서 다시 시도해 주세요." : "로그인이 완료되었습니다. 인트라넷의 네이버 트렌드 화면에서 계속 이용해 주세요.", 200, true);
+    const response = respondHtml(payload.error ? "로그인을 완료하지 못했습니다. 인트라넷 화면에서 다시 시도해 주세요." : "로그인이 완료되었습니다. 인트라넷의 네이버 트렌드 화면에서 계속 이용해 주세요.", 200, true);
+    response.headers.set("set-cookie", `${googleBrowserCookieName(state)}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`);
+    return response;
   }
   if (payload.error) return redirectToClientReturn(state.return_to, { auth_error: payload.error });
   const session = await createAuthSession(db, payload.user!);
@@ -513,6 +591,13 @@ async function handleGoogleAuthCallback(db: D1Database, request: Request, env: E
     return redirectToClientReturn(returnTo, {
       auth_error: "GOOGLE_STATE_EXPIRED"
     });
+  }
+
+  if (stateRow.handoff_secret_hash) {
+    const cookie = googleBrowserCookie(request, stateRow);
+    if (!stateRow.handoff_browser_hash || !cookie || await sha256Base64Url(cookie) !== stateRow.handoff_browser_hash) {
+      return respondHtml("로그인을 시작한 브라우저와 인증 창이 일치하지 않습니다. 인트라넷에서 다시 시작해 주세요.", 400, true);
+    }
   }
 
   const claimed = await one<{ id: string }>(db, "UPDATE auth_oauth_states SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at>? RETURNING id", [now, stateRow.id, now]);
@@ -3333,7 +3418,7 @@ async function applySchemaChanges(db: D1Database) {
   const userColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(users)")).map((column) => column.name));
 
   const oauthColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(auth_oauth_states)")).map((column) => column.name));
-  for (const column of ["handoff_secret_hash", "handoff_user_id", "handoff_error", "handoff_consumed_at"]) {
+  for (const column of ["handoff_secret_hash", "handoff_user_id", "handoff_error", "handoff_consumed_at", "handoff_browser_hash"]) {
     if (!oauthColumns.has(column)) await run(db, `ALTER TABLE auth_oauth_states ADD COLUMN ${column} TEXT`);
   }
   await run(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_handoff_hash ON auth_oauth_states(handoff_secret_hash) WHERE handoff_secret_hash IS NOT NULL");
@@ -3440,6 +3525,7 @@ interface AuthOauthStateRow {
   handoff_user_id: string | null;
   handoff_error: string | null;
   handoff_consumed_at: string | null;
+  handoff_browser_hash: string | null;
 }
 
 interface GoogleAuthConfig {

@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS auth_oauth_states (
   handoff_secret_hash TEXT,
   handoff_user_id TEXT,
   handoff_error TEXT,
-  handoff_consumed_at TEXT
+  handoff_consumed_at TEXT,
+  handoff_browser_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trend_profiles (
