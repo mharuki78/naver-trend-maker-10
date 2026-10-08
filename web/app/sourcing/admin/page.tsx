@@ -140,7 +140,8 @@ type AuthFormState = {
 
 type AuthSessionResponse = ApiError | { ok: true; session: AuthSessionState };
 type AuthTokenSessionResponse = ApiError | { ok: true; session: AuthTokenSession };
-type AuthGoogleStartResponse = ApiError | { ok: true; authorizationUrl: string };
+type AuthGoogleStartResponse = ApiError | { ok: true; authorizationUrl: string; handoffKey?: string };
+type AuthGoogleCompletionResponse = ApiError | { ok: true; pending: true } | { ok: true; session: AuthTokenSession };
 
 const initialForm: TrendFormState = {
   category1: "",
@@ -187,6 +188,9 @@ export default function SourcingAdminPage() {
   const [heatmapMode, setHeatmapMode] = useState<"timeline" | "season">("season");
   const [detailLoadingRunId, setDetailLoadingRunId] = useState<string | null>(null);
   const drilldownRef = useRef<HTMLElement | null>(null);
+  const googleAuthAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => googleAuthAbortRef.current?.abort(), []);
 
   const latestCollectiblePeriod = getLatestCollectibleTrendPeriod();
   const analysisPeriods = listMonthlyPeriods(TREND_MONTHLY_START_PERIOD, latestCollectiblePeriod);
@@ -521,27 +525,50 @@ export default function SourcingAdminPage() {
       return;
     }
 
+    const embedded = window.self !== window.top;
+    const controller = new AbortController();
+    googleAuthAbortRef.current = controller;
     setAuthSubmitting(true);
     setError(null);
+    if (embedded) setFeedback({ tone: "info", text: "Google 인증 창에서 로그인해 주세요. 완료되면 이 인트라넷 화면에서 바로 이어집니다." });
 
     const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`;
     try {
       const result = await startGoogleLogin({
-        embedded: window.self !== window.top,
-        openTab: () => window.open("about:blank", "_blank"),
+        embedded,
+        openTab: () => window.open("about:blank", "_blank", "popup=yes,width=520,height=680"),
         redirect: (url) => window.location.assign(url),
       }, () => api<AuthGoogleStartResponse>(
         apiBaseUrl,
-        `/auth/google/start?return_to=${encodeURIComponent(returnTo)}`
-      ));
-      if (result.openedNewTab) {
-        setFeedback({ tone: "info", text: "Google 로그인 탭을 열었습니다. 로그인 후 해당 탭에서 분석을 계속해 주세요." });
+        `/auth/google/start?return_to=${encodeURIComponent(returnTo)}${embedded ? "&embedded=1" : ""}`,
+        { signal: controller.signal }
+      ), async handoffKey => {
+        const deadline = Date.now() + 15 * 60 * 1000;
+        while (Date.now() < deadline) {
+          controller.signal.throwIfAborted();
+          const completion = await api<AuthGoogleCompletionResponse>(apiBaseUrl, "/auth/google/complete", {
+            method: "POST", body: JSON.stringify({ handoffKey }), signal: controller.signal,
+          });
+          controller.signal.throwIfAborted();
+          if (!completion.ok) throw new Error(completion.message ?? "Google 로그인을 완료하지 못했습니다.");
+          if ("session" in completion) return completion.session;
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        throw new Error("Google 로그인 대기 시간이 만료되었습니다. 다시 로그인해 주세요.");
+      });
+      if (result.session) {
+        window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, result.session.token);
+        setSessionToken(result.session.token);
+        setAuthState({ authenticated: true, user: result.session.user, expiresAt: result.session.expiresAt });
+        setAuthReady(true);
+        setFeedback({ tone: "success", text: "Google 로그인이 완료되었습니다. 인트라넷 안에서 분석을 계속하세요." });
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Google 로그인 연결을 시작하지 못했습니다.";
+      const message = controller.signal.aborted ? "Google 로그인을 취소했습니다. 다시 로그인할 수 있습니다." : error instanceof Error ? error.message : "Google 로그인 연결을 시작하지 못했습니다.";
       setError(message);
       setFeedback({ tone: "error", text: message });
     } finally {
+      googleAuthAbortRef.current = null;
       setAuthSubmitting(false);
     }
   }
@@ -966,7 +993,8 @@ export default function SourcingAdminPage() {
                   Google로 로그인
                   <ExternalLink size={15} />
                 </button>
-                <p className={styles.providerNote}>Google 계정으로 시작할 수 있습니다. 인트라넷에서는 별도 탭으로 열립니다. <a href="/privacy" target="_blank" rel="noreferrer" style={{ textDecoration: "underline" }}>개인정보 안내</a></p>
+                <p className={styles.providerNote}>Google 인증 후 이 화면에서 분석을 계속합니다. <a href="/privacy" target="_blank" rel="noreferrer" style={{ textDecoration: "underline" }}>개인정보 안내</a></p>
+                {authSubmitting && googleAuthAbortRef.current && <button className={styles.ghostButton} type="button" onClick={() => googleAuthAbortRef.current?.abort()}>Google 로그인 취소</button>}
               </div>
 
               <div className={styles.providerDivider} role="presentation">

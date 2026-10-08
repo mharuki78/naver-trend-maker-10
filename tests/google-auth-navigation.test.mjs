@@ -24,9 +24,9 @@ test('embedded login opens a separate tab before the network wait and keeps Goog
   const result = await startGoogleLogin(browser, async () => {
     assert.deepEqual(events, [['open']]);
     assert.equal(tab.opener, null);
-    return { ok: true, authorizationUrl };
-  });
-  assert.deepEqual(events, [['open'], ['tab-navigation', authorizationUrl]]);
+    return { ok: true, authorizationUrl, handoffKey: 'private-proof' };
+  }, async () => ({ authenticated: true, token: 'test-session', user: { id: 'u1', email: 'frame@example.com', name: 'Frame User' }, expiresAt: '2099-01-01' }));
+  assert.deepEqual(events, [['open'], ['tab-navigation', authorizationUrl], ['close']]);
   assert.equal(result.openedNewTab, true);
 });
 
@@ -70,4 +70,17 @@ test('closing the pending tab while the API is responding stops navigation', asy
     return { ok: true, authorizationUrl };
   }), /닫/);
   assert.equal(events.some(([event]) => event.includes('navigation')), false);
+});
+
+test('embedded authentication closes its temporary window and delivers the completed session to the iframe', async () => {
+  const { browser, tab, events } = browserFixture();
+  const session = { authenticated: true, token: 'iframe-session-token', user: { id: 'u1', email: 'iframe@example.com', name: 'Iframe User' }, expiresAt: '2099-01-01' };
+  const result = await startGoogleLogin(browser, async () => ({ ok: true, authorizationUrl, handoffKey: 'private-iframe-proof' }), async key => {
+    assert.equal(key, 'private-iframe-proof');
+    assert.equal(tab.opener, null);
+    assert.deepEqual(events, [['open'], ['tab-navigation', authorizationUrl]]);
+    return session;
+  });
+  assert.deepEqual(result.session, session);
+  assert.equal(tab.closed, true);
 });

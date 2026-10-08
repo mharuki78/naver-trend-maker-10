@@ -1,5 +1,7 @@
+import type { AuthTokenSession } from "@runacademy/shared";
+
 type GoogleStartResponse =
-  | { ok: true; authorizationUrl: string }
+  | { ok: true; authorizationUrl: string; handoffKey?: string }
   | { ok: false; message?: string };
 
 export type GoogleLoginTab = {
@@ -18,6 +20,7 @@ export type GoogleLoginBrowser = {
 export async function startGoogleLogin(
   browser: GoogleLoginBrowser,
   authorize: () => Promise<GoogleStartResponse>,
+  waitForSession?: (handoffKey: string) => Promise<AuthTokenSession>,
 ) {
   // Open synchronously during the click: waiting for the API first loses
   // the browser's user activation and may trigger the popup blocker.
@@ -40,7 +43,16 @@ export async function startGoogleLogin(
     } else {
       browser.redirect(destination.href);
     }
-    return { openedNewTab: Boolean(tab) };
+    if (tab) {
+      if (!response.handoffKey || !waitForSession) {
+        throw new Error("인트라넷 로그인 연결을 확인하지 못했습니다. 화면을 새로고침하고 다시 시도해 주세요.");
+      }
+      const session = await waitForSession(response.handoffKey);
+      // COOP may sever the popup reference; the callback also closes itself.
+      try { tab.close(); } catch { /* The login window may already be closed. */ }
+      return { openedNewTab: true, session };
+    }
+    return { openedNewTab: false, session: undefined };
   } catch (error) {
     if (tab && !tab.closed) tab.close();
     throw error;

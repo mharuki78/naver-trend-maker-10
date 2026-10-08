@@ -83,6 +83,7 @@ const GOOGLE_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const GOOGLE_OAUTH_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo";
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
+  "cache-control": "no-store",
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
   "access-control-allow-headers": "content-type, authorization"
@@ -142,6 +143,11 @@ export default {
 
       if (request.method === "GET" && pathname === "/v1/auth/google/callback") {
         return await handleGoogleAuthCallback(env.DB, request, env);
+      }
+
+      if (request.method === "POST" && pathname === "/v1/auth/google/complete") {
+        const body = (await request.json()) as { handoffKey?: unknown };
+        return respondJson(await completeEmbeddedGoogleAuth(env.DB, body.handoffKey));
       }
 
       if (request.method === "POST" && pathname === "/v1/auth/logout") {
@@ -419,14 +425,17 @@ async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
   const now = nowIso();
   const state = randomToken(24);
   const expiresAt = addMinutes(now, AUTH_OAUTH_STATE_TTL_MINUTES);
+  // This proof stays in the initiating frame, never in Google's URL or the popup.
+  const handoffKey = requestUrl.searchParams.get("embedded") === "1" ? randomToken(32) : null;
+  const handoffHash = handoffKey ? await sha256Base64Url(handoffKey) : null;
 
-  await run(db, "DELETE FROM auth_oauth_states WHERE expires_at <= ? OR used_at IS NOT NULL", [now]);
+  await run(db, "DELETE FROM auth_oauth_states WHERE expires_at <= ? OR (used_at IS NOT NULL AND handoff_secret_hash IS NULL) OR handoff_consumed_at IS NOT NULL", [now]);
   await run(
     db,
     `INSERT INTO auth_oauth_states (
-      id, provider, state, return_to, created_at, expires_at, used_at
-    ) VALUES (?, 'google', ?, ?, ?, ?, NULL)`,
-    [crypto.randomUUID(), state, returnTo, now, expiresAt]
+      id, provider, state, return_to, created_at, expires_at, used_at, handoff_secret_hash
+    ) VALUES (?, 'google', ?, ?, ?, ?, NULL, ?)`,
+    [crypto.randomUUID(), state, returnTo, now, expiresAt, handoffHash]
   );
 
   const authorizationUrl = new URL(GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT);
@@ -442,8 +451,38 @@ async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
 
   return {
     ok: true as const,
-    authorizationUrl: authorizationUrl.toString()
+    authorizationUrl: authorizationUrl.toString(),
+    ...(handoffKey ? { handoffKey } : {})
   };
+}
+
+async function completeEmbeddedGoogleAuth(db: D1Database, proof: unknown) {
+  const invalid = { ok: false as const, code: "INVALID_GOOGLE_HANDOFF", message: "Google 로그인 연결이 만료되었거나 이미 완료되었습니다. 다시 로그인해 주세요." };
+  if (typeof proof !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(proof)) return invalid;
+  const hash = await sha256Base64Url(proof);
+  const now = nowIso();
+  const state = await one<AuthOauthStateRow>(db, "SELECT * FROM auth_oauth_states WHERE handoff_secret_hash=? AND provider='google' AND expires_at>? AND handoff_consumed_at IS NULL LIMIT 1", [hash, now]);
+  if (!state) return invalid;
+  if (!state.handoff_user_id && !state.handoff_error) return { ok: true as const, pending: true as const };
+  // An atomic claim prevents concurrent polling requests from creating two sessions.
+  const claimed = await one<AuthOauthStateRow>(db, "UPDATE auth_oauth_states SET handoff_consumed_at=? WHERE id=? AND handoff_consumed_at IS NULL AND expires_at>? RETURNING *", [now, state.id, now]);
+  if (!claimed) return invalid;
+  if (claimed.handoff_error) {
+    return { ok: false as const, code: claimed.handoff_error, message: "Google 로그인을 완료하지 못했습니다. 취소했거나 연결이 중단된 경우 다시 로그인해 주세요." };
+  }
+  const user = await one<AuthUserRow>(db, "SELECT * FROM users WHERE id=? LIMIT 1", [claimed.handoff_user_id]);
+  if (!user) return invalid;
+  return { ok: true as const, session: await createAuthSession(db, mapAuthUser(user)) };
+}
+
+async function finishGoogleAuth(db: D1Database, state: AuthOauthStateRow, payload: { user?: AuthUser; error?: string }) {
+  if (state.handoff_secret_hash) {
+    await run(db, "UPDATE auth_oauth_states SET handoff_user_id=?,handoff_error=? WHERE id=?", [payload.user?.id ?? null, payload.error ?? null, state.id]);
+    return respondHtml(payload.error ? "로그인을 완료하지 못했습니다. 인트라넷 화면에서 다시 시도해 주세요." : "로그인이 완료되었습니다. 인트라넷의 네이버 트렌드 화면에서 계속 이용해 주세요.", 200, true);
+  }
+  if (payload.error) return redirectToClientReturn(state.return_to, { auth_error: payload.error });
+  const session = await createAuthSession(db, payload.user!);
+  return redirectToClientReturn(state.return_to, { auth_token: session.token, auth_provider: "google" });
 }
 
 async function handleGoogleAuthCallback(db: D1Database, request: Request, env: Env) {
@@ -470,42 +509,33 @@ async function handleGoogleAuthCallback(db: D1Database, request: Request, env: E
   const now = nowIso();
   const returnTo = stateRow.return_to;
   if (stateRow.used_at || stateRow.expires_at <= now) {
+    if (stateRow.handoff_secret_hash) return respondHtml("이미 완료되었거나 만료된 Google 로그인입니다. 인트라넷 화면에서 다시 시도해 주세요.", 200, true);
     return redirectToClientReturn(returnTo, {
       auth_error: "GOOGLE_STATE_EXPIRED"
     });
   }
 
-  await run(db, "UPDATE auth_oauth_states SET used_at = ? WHERE id = ? AND used_at IS NULL", [now, stateRow.id]);
+  const claimed = await one<{ id: string }>(db, "UPDATE auth_oauth_states SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at>? RETURNING id", [now, stateRow.id, now]);
+  if (!claimed) return respondHtml("이미 완료되었거나 만료된 Google 로그인입니다. 원래 화면에서 다시 시도해 주세요.", 400);
 
   const googleError = requestUrl.searchParams.get("error")?.trim();
   if (googleError) {
-    return redirectToClientReturn(returnTo, {
-      auth_error: mapGoogleOauthErrorCode(googleError)
-    });
+    return finishGoogleAuth(db, stateRow, { error: mapGoogleOauthErrorCode(googleError) });
   }
 
   const code = requestUrl.searchParams.get("code")?.trim() ?? "";
   if (!code) {
-    return redirectToClientReturn(returnTo, {
-      auth_error: "GOOGLE_CODE_MISSING"
-    });
+    return finishGoogleAuth(db, stateRow, { error: "GOOGLE_CODE_MISSING" });
   }
 
   try {
     const token = await exchangeGoogleAuthorizationCode(request, googleAuthConfig, code);
     const googleUser = await fetchGoogleUserInfo(token.accessToken);
     const authUser = await upsertGoogleUser(db, googleUser);
-    const authSession = await createAuthSession(db, authUser);
-
-    return redirectToClientReturn(returnTo, {
-      auth_token: authSession.token,
-      auth_provider: "google"
-    });
+    return await finishGoogleAuth(db, stateRow, { user: authUser });
   } catch (error) {
     console.error("google auth callback failed", error);
-    return redirectToClientReturn(returnTo, {
-      auth_error: "GOOGLE_LOGIN_FAILED"
-    });
+    return finishGoogleAuth(db, stateRow, { error: "GOOGLE_LOGIN_FAILED" });
   }
 }
 
@@ -3194,15 +3224,17 @@ function parseJson<T>(value: string | null, fallback: T): T {
   }
 }
 
-function respondHtml(message: string, status = 200) {
+function respondHtml(message: string, status = 200, closeLoginWindow = false) {
   return new Response(
     `<!doctype html><html lang="ko"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>한이룸 네이버 트렌드 마법사</title></head><body style="font-family:Pretendard,system-ui,sans-serif;background:#f7f4ef;color:#233847;padding:32px;"><main style="max-width:520px;margin:10vh auto;padding:24px;border-radius:24px;background:#fff;border:1px solid rgba(19,34,44,0.08);box-shadow:0 18px 34px rgba(26,44,61,0.08);"><h1 style="margin:0 0 12px;font-size:28px;line-height:1.15;">Google 로그인 안내</h1><p style="margin:0;font-size:16px;line-height:1.7;">${escapeHtml(
       message
-    )}</p></main></body></html>`,
+    )}</p></main>${closeLoginWindow ? '<script>window.close()</script>' : ''}</body></html>`,
     {
       status,
       headers: {
-        "content-type": "text/html; charset=utf-8"
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "referrer-policy": "no-referrer"
       }
     }
   );
@@ -3299,6 +3331,12 @@ async function applySchemaChanges(db: D1Database) {
     )`
   );
   const userColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(users)")).map((column) => column.name));
+
+  const oauthColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(auth_oauth_states)")).map((column) => column.name));
+  for (const column of ["handoff_secret_hash", "handoff_user_id", "handoff_error", "handoff_consumed_at"]) {
+    if (!oauthColumns.has(column)) await run(db, `ALTER TABLE auth_oauth_states ADD COLUMN ${column} TEXT`);
+  }
+  await run(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_handoff_hash ON auth_oauth_states(handoff_secret_hash) WHERE handoff_secret_hash IS NOT NULL");
 
   if (!userColumns.has("google_subject")) {
     await run(db, "ALTER TABLE users ADD COLUMN google_subject TEXT");
@@ -3398,6 +3436,10 @@ interface AuthOauthStateRow {
   created_at: string;
   expires_at: string;
   used_at: string | null;
+  handoff_secret_hash: string | null;
+  handoff_user_id: string | null;
+  handoff_error: string | null;
+  handoff_consumed_at: string | null;
 }
 
 interface GoogleAuthConfig {

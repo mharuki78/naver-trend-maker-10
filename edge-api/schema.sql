@@ -29,7 +29,11 @@ CREATE TABLE IF NOT EXISTS auth_oauth_states (
   return_to TEXT NOT NULL,
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  used_at TEXT
+  used_at TEXT,
+  handoff_secret_hash TEXT,
+  handoff_user_id TEXT,
+  handoff_error TEXT,
+  handoff_consumed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trend_profiles (

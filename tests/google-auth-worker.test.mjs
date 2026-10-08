@@ -83,3 +83,79 @@ test('the new service still rejects an anonymous request for work history', asyn
   assert.equal(response.status, 401);
   assert.equal((await response.json()).code, 'AUTH_REQUIRED');
 });
+
+function completionRequest(handoffKey) {
+  return new Request('https://api.example/v1/auth/google/complete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ handoffKey }),
+  });
+}
+
+async function embeddedStart(env) {
+  const request = authRequest(`${frontend}/sourcing/admin`);
+  const url = new URL(request.url);
+  url.searchParams.set('embedded', '1');
+  return (await worker.fetch(new Request(url), env, { waitUntil() {} })).json();
+}
+
+test('embedded login issues a private proof separate from the Google URL and keeps a pending iframe unsigned in', async t => {
+  const { env, sqlite } = workerFixture(t);
+  const started = await embeddedStart(env);
+  assert.equal(typeof started.handoffKey, 'string');
+  assert.ok(started.handoffKey.length >= 43);
+  assert.equal(started.authorizationUrl.includes(started.handoffKey), false);
+  const state = sqlite.prepare('SELECT * FROM auth_oauth_states').get();
+  assert.notEqual(state.handoff_secret_hash, started.handoffKey);
+  const pending = await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} });
+  assert.deepEqual(await pending.json(), { ok: true, pending: true });
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
+});
+
+test('Google success returns one session to the initiating iframe and never opens an analysis redirect', async t => {
+  const { env, sqlite } = workerFixture(t);
+  const started = await embeddedStart(env);
+  assert.equal(typeof started.handoffKey, 'string');
+  const state = new URL(started.authorizationUrl).searchParams.get('state');
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    if (String(url) === 'https://oauth2.googleapis.com/token') {
+      return Response.json({ access_token: 'provider-only-test-access-token', token_type: 'Bearer', expires_in: 3600, scope: 'openid email profile' });
+    }
+    assert.equal(String(url), 'https://openidconnect.googleapis.com/v1/userinfo');
+    return Response.json({ sub: 'test-google-subject', email: 'iframe@example.com', email_verified: true, name: 'Iframe User' });
+  });
+  const callback = await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&code=valid-test-code`), env, { waitUntil() {} });
+  assert.equal(callback.status, 200);
+  assert.equal(callback.headers.get('location'), null);
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
+  const wrongProof = await worker.fetch(completionRequest(state), env, { waitUntil() {} });
+  assert.equal((await wrongProof.json()).ok, false);
+  // Another member starting login must not purge a completed, unclaimed handoff.
+  await embeddedStart(env);
+  const completed = await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} });
+  const result = await completed.json();
+  assert.equal(result.ok, true);
+  assert.equal(result.session.authenticated, true);
+  assert.equal(result.session.user.email, 'iframe@example.com');
+  const session = await worker.fetch(new Request('https://api.example/v1/auth/session', {
+    headers: { Authorization: `Bearer ${result.session.token}` },
+  }), env, { waitUntil() {} });
+  assert.equal((await session.json()).session.authenticated, true);
+  const replay = await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} });
+  assert.equal((await replay.json()).ok, false);
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 1);
+});
+
+test('cancelled or expired Google login cannot leave the iframe waiting or create a session', async t => {
+  const { env, sqlite } = workerFixture(t);
+  const started = await embeddedStart(env);
+  assert.equal(typeof started.handoffKey, 'string');
+  const state = new URL(started.authorizationUrl).searchParams.get('state');
+  await worker.fetch(new Request(`https://api.example/v1/auth/google/callback?state=${state}&error=access_denied`), env, { waitUntil() {} });
+  const denied = await worker.fetch(completionRequest(started.handoffKey), env, { waitUntil() {} });
+  assert.equal((await denied.json()).code, 'GOOGLE_ACCESS_DENIED');
+  const expired = await embeddedStart(env);
+  sqlite.prepare("UPDATE auth_oauth_states SET expires_at='2000-01-01T00:00:00.000Z' WHERE state=?").run(new URL(expired.authorizationUrl).searchParams.get('state'));
+  const timeout = await worker.fetch(completionRequest(expired.handoffKey), env, { waitUntil() {} });
+  assert.equal((await timeout.json()).ok, false);
+  assert.equal(sqlite.prepare('SELECT count(*) AS count FROM auth_sessions').get().count, 0);
+});
