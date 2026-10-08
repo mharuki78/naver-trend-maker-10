@@ -1,0 +1,18 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "baegot-naver-trend-api",
+  "account_id": "4c52765353875fe8bd3ad9cffad1c5fb",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": { "crons": ["*/2 * * * *"] },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "baegot-naver-trend-db",
+    "database_id": "8350fd62-646c-47ab-805a-10d21ab58164"
+  }],
+  "vars": {
+    "APP_NAME": "baegot-naver-trend-api",
+    "AUTH_ALLOWED_RETURN_ORIGINS": "https://baegot-naver-trend.vercel.app"
+  }
+}

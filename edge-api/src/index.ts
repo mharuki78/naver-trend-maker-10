@@ -2972,14 +2972,10 @@ function resolveSafeReturnTo(request: Request, requestedReturnTo: string | null,
   }
 
   const requestedOrigin = returnUrl.origin;
-  const allowedOrigins = [
-    ...DEFAULT_ALLOWED_AUTH_RETURN_ORIGINS,
-    ...parseCsvList(env.AUTH_ALLOWED_RETURN_ORIGINS)
-  ];
-  const requestOrigin = request.headers.get("origin");
-  const refererOrigin = getRequestOrigin(request.headers.get("referer"));
+  const configuredOrigins = parseCsvList(env.AUTH_ALLOWED_RETURN_ORIGINS);
+  const allowedOrigins = configuredOrigins.length ? configuredOrigins : DEFAULT_ALLOWED_AUTH_RETURN_ORIGINS;
 
-  if (requestOrigin === requestedOrigin || refererOrigin === requestedOrigin || originMatchesAllowedPatterns(requestedOrigin, allowedOrigins)) {
+  if (originMatchesAllowedPatterns(requestedOrigin, allowedOrigins)) {
     return `${returnUrl.origin}${returnUrl.pathname}${returnUrl.search}`;
   }
 

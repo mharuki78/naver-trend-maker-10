@@ -4,6 +4,28 @@
 
 이 프로젝트는 LLM API를 사용하지 않습니다. 네이버 쇼핑인사이트 월별 인기검색어를 수집하고, Cloudflare Worker와 D1에서 캐시/분석합니다.
 
+## 배곧 운영 연결
+
+- 웹: `https://baegot-naver-trend.vercel.app/sourcing/admin`
+- API: `https://baegot-naver-trend-api.baekhyunjin.workers.dev/v1`
+- Cloudflare Worker / D1: `baegot-naver-trend-api` / `baegot-naver-trend-db`
+- Google Cloud 프로젝트: `baegot-intranet-auth`, 웹 OAuth 클라이언트 `baegot-naver-trend-web`
+- 개인정보 안내: `https://baegot-naver-trend.vercel.app/privacy`
+
+배곧 환경은 `edge-api/wrangler.baegot.jsonc`를 사용합니다. 기존 환경의 Worker·DB·비밀값을 복사하지 않습니다. Google 로그인은 `openid email profile`만 요청하며, `GOOGLE_OAUTH_CLIENT_ID`와 `GOOGLE_OAUTH_CLIENT_SECRET`은 배곧 Worker의 암호화된 비밀값으로 관리합니다. 콜백은 `https://baegot-naver-trend-api.baekhyunjin.workers.dev/v1/auth/google/callback`입니다.
+
+Vercel 프로젝트의 Root Directory는 `web`, Framework는 Next.js, Output Directory는 기본값입니다. Production과 Preview의 `NEXT_PUBLIC_API_BASE_URL`은 위 배곧 API 주소입니다. Google 로그인 완료 주소는 명시적으로 허용한 운영 도메인만 사용할 수 있으므로 Preview에서 Google 로그인을 검수할 때에는 별도의 승인된 주소 설정이 필요합니다.
+
+```bash
+npm test
+# 인증된 배곧 Cloudflare 계정에서 실행할 때만 실제 배포합니다.
+pnpm wrangler deploy --config edge-api/wrangler.baegot.jsonc
+```
+
+`npm test`는 Worker를 로컬에서 번들링하고 메모리 SQLite로 인증·리디렉션 검사를 실행합니다. 운영 DB에 접속하거나 배포하지 않습니다. CLI 인증이 없는 경우 Cloudflare의 해당 Worker → Edit code에 `.local/baegot-worker/index.js`를 적용하고 Deploy할 수 있습니다. UI 배포 후 `DB` 바인딩, 암호화된 OAuth 비밀값, 호환 옵션, 2분 Cron 설정을 유지해야 합니다.
+
+인트라넷에서 Google 로그인을 누르면 별도 탭이 먼저 열립니다. 로그인 후 그 탭에서 계속 분석하며, 인트라넷 계정과 도구 계정은 별개입니다. 새 배곧 DB에는 이전 서비스의 계정과 작업 기록이 자동 이전되지 않습니다. Google 로그인은 Google 계정으로 시작할 수 있으며 이메일 가입도 지원합니다. Google Sheets 자동 동기화는 별도 서비스 계정 설정이 필요합니다.
+
 ## 구성
 
 - `web`: `/sourcing/admin` 화면과 루트 리다이렉트
@@ -30,7 +52,7 @@ pnpm --filter @runacademy/web dev
 선택 사항:
 
 - 로컬에서 Worker까지 같이 확인하려면 `npx wrangler dev --config edge-api/wrangler.jsonc`를 함께 실행합니다.
-- 프론트는 개발 환경에서 `NEXT_PUBLIC_API_BASE_URL`이 없으면 기본적으로 공용 API `https://naver-trend-maker-api.redpill-han.workers.dev/v1`을 바라봅니다.
+- 프론트는 개발 환경에서 `NEXT_PUBLIC_API_BASE_URL`이 없으면 배곧 API `https://baegot-naver-trend-api.baekhyunjin.workers.dev/v1`을 바라봅니다.
 - 로컬 Worker를 직접 붙이고 싶다면 `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8787/v1`로 따로 지정해 주세요.
 
 관리자 화면:

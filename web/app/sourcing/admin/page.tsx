@@ -48,11 +48,12 @@ import {
   type TrendRunDetail
 } from "@runacademy/shared";
 import { STATIC_TREND_ROOT_CATEGORIES, getStaticTrendCategoryChildren } from "../../../lib/trend-category-fallback";
+import { startGoogleLogin } from "../../../lib/google-auth-navigation";
 import styles from "./admin.module.css";
 
 const ENV_API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "");
 const AUTH_TOKEN_STORAGE_KEY = "hanirum:naver-trend-auth-token";
-const LOCAL_DEV_API_BASE_URL = "https://naver-trend-maker-api.redpill-han.workers.dev/v1";
+const LOCAL_DEV_API_BASE_URL = "https://baegot-naver-trend-api.baekhyunjin.workers.dev/v1";
 
 const DEVICE_OPTIONS = [
   ["pc", "PC"],
@@ -524,22 +525,25 @@ export default function SourcingAdminPage() {
     setError(null);
 
     const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`;
-    const response = await api<AuthGoogleStartResponse>(
-      apiBaseUrl,
-      `/auth/google/start?return_to=${encodeURIComponent(returnTo)}`
-    );
-
-    if (!response.ok) {
+    try {
+      const result = await startGoogleLogin({
+        embedded: window.self !== window.top,
+        openTab: () => window.open("about:blank", "_blank"),
+        redirect: (url) => window.location.assign(url),
+      }, () => api<AuthGoogleStartResponse>(
+        apiBaseUrl,
+        `/auth/google/start?return_to=${encodeURIComponent(returnTo)}`
+      ));
+      if (result.openedNewTab) {
+        setFeedback({ tone: "info", text: "Google 로그인 탭을 열었습니다. 로그인 후 해당 탭에서 분석을 계속해 주세요." });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Google 로그인 연결을 시작하지 못했습니다.";
+      setError(message);
+      setFeedback({ tone: "error", text: message });
+    } finally {
       setAuthSubmitting(false);
-      setError(response.message ?? "Google 로그인 연결을 시작하지 못했습니다.");
-      setFeedback({
-        tone: "error",
-        text: response.message ?? "Google 로그인 연결을 시작하지 못했습니다."
-      });
-      return;
     }
-
-    window.location.assign(response.authorizationUrl);
   }
 
   async function handleLogout() {
@@ -959,10 +963,10 @@ export default function SourcingAdminPage() {
                       G
                     </span>
                   )}
-                  Google로 3초 로그인
+                  Google로 로그인
                   <ExternalLink size={15} />
                 </button>
-                <p className={styles.providerNote}>회원가입 없이 바로 시작하고 싶다면 Google 로그인을 사용해도 됩니다.</p>
+                <p className={styles.providerNote}>Google 계정으로 시작할 수 있습니다. 인트라넷에서는 별도 탭으로 열립니다. <a href="/privacy" target="_blank" rel="noreferrer" style={{ textDecoration: "underline" }}>개인정보 안내</a></p>
               </div>
 
               <div className={styles.providerDivider} role="presentation">
