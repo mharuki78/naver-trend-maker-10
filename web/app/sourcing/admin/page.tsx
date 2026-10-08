@@ -856,8 +856,8 @@ export default function SourcingAdminPage() {
       <div className={styles.shell}>
         <header className={styles.header}>
           <div className={styles.headerCopy}>
-            <p className={styles.eyebrow}>HANIRUM</p>
-            <h1 className={styles.title}>한이룸의 네이버 트렌드 마법사 1.0</h1>
+            <p className={styles.eyebrow}>BAEGOT</p>
+            <h1 className={styles.title}>네이버 트렌드 마법사</h1>
             <p className={styles.description}>
               장기간 월별 인기검색어를 취합해 앞으로 준비해야 할 키워드, 조심해야 할 키워드, 시즌형 수요를
               더 입체적으로 보여줍니다.
