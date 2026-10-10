@@ -1973,7 +1973,95 @@
 
 @media (max-width: 780px) {
   .page {
-    padding: 20px 14px 40px;
+    padding: 16px 12px 32px;
+    font-size: 14px;
+    line-height: 1.6;
+    word-break: keep-all;
+    overflow-wrap: anywhere;
+  }
+
+  .shell,
+  .workspace,
+  .controlStack,
+  .resultStack,
+  .outputSurface {
+    gap: 14px;
+    min-width: 0;
+  }
+
+  .shell > *,
+  .workspace > * {
+    min-width: 0;
+  }
+
+  .header,
+  .headerCopy {
+    gap: 8px;
+  }
+
+  .headerMeta {
+    gap: 6px;
+  }
+
+  .summaryPill,
+  .badge {
+    min-height: 30px;
+    padding: 5px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .surface,
+  .progressPanel,
+  .chartPanel,
+  .previewPanel,
+  .analysisPanel,
+  .insightCard,
+  .summaryCard,
+  .progressStat,
+  .emptyPanel,
+  .filterGroup,
+  .optionSection,
+  .brandSection,
+  .setupPanel,
+  .connectionCard {
+    padding: 14px;
+    border-radius: 16px;
+    min-width: 0;
+  }
+
+  .setupTitle,
+  .surfaceTitle,
+  .progressTitle {
+    font-size: 21px;
+    line-height: 1.4;
+    letter-spacing: -0.02em;
+  }
+
+  .panelTitle,
+  .insightTitle {
+    font-size: 18px;
+    line-height: 1.4;
+  }
+
+  .setupTab,
+  .secondaryButton,
+  .primaryButton,
+  .segmentedButton,
+  .chipButton {
+    min-height: 44px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+
+  .fieldInput {
+    min-height: 44px;
+    font-size: 16px;
+    border-radius: 12px;
+  }
+
+  .setupActions > button {
+    flex: 1 1 auto;
   }
 
   .formGrid,
@@ -2021,7 +2109,9 @@
   }
 
   .title {
-    font-size: 34px;
+    font-size: 24px;
+    line-height: 1.35;
+    letter-spacing: -0.03em;
   }
 
   .outputStatus {
